@@ -16,56 +16,60 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
     internal static class HotReloadEntryApplier
     {
         /// <summary>
-        /// Applies the group's entries file by file against the one compiled shim assembly, and
-        /// returns one result per file in the order the files were sent to the worker.
+        /// Applies the group's prepared files against the one compiled shim assembly, and returns
+        /// one result per file in the order the files were sent to the worker.
         /// </summary>
         /// <remarks>
         /// Why per file: the shim assembly is shared, but a generation, an added-field ledger and
         /// an apply result all belong to a single file, and a file whose entries cannot be
-        /// resolved must not stop its siblings from being applied.
+        /// resolved must not stop its siblings from being applied. The whole group is prepared
+        /// (bound and resolved) by an earlier stage, so nothing is mutated while a sibling can
+        /// still fail preflight.
         /// </remarks>
-        internal static IReadOnlyList<HotReloadFileProcessResult> ApplyGroupAndBuildResults(
+        internal static IReadOnlyList<HotReloadFileProcessResult> ApplyPreparedEntries(
             HotReloadApplyContext context,
             HotReloadShimCompileResult compileResult,
-            TransformWorkerEntryDto[] entriesToPatch)
+            IReadOnlyList<HotReloadPreparedGroupFile> preparedFiles)
         {
             Debug.Assert(context != null, "context must not be null.");
             Debug.Assert(compileResult != null, "compileResult must not be null.");
-            Debug.Assert(entriesToPatch != null, "entriesToPatch must not be null.");
+            Debug.Assert(preparedFiles != null, "preparedFiles must not be null.");
 
-            Dictionary<string, List<TransformWorkerEntryDto>> entriesByFile =
-                HotReloadWorkerRowsByFile.GroupEntriesBySourceFile(entriesToPatch, context.ProjectRelativePaths);
-            // Why once for the group: every shim type of the group lives in this one assembly, so
-            // binding per file would re-run the same binders and hide which file first failed.
-            Dictionary<string, string> bindFailures = BindShimAccessors(compileResult.Assembly);
             List<HotReloadFileProcessResult> results =
-                new List<HotReloadFileProcessResult>(context.Files.Count);
-            foreach (HotReloadGroupFile file in context.Files)
+                new List<HotReloadFileProcessResult>(preparedFiles.Count);
+            foreach (HotReloadPreparedGroupFile prepared in preparedFiles)
             {
-                if (file.SkipApply)
-                {
-                    results.Add(HotReloadFileEntryApplier.BuildUnappliedResult(file));
-                    continue;
-                }
-
-                List<TransformWorkerEntryDto> fileEntries = entriesByFile[file.ProjectRelativePath];
-                if (fileEntries.Count == 0)
-                {
-                    HotReloadFileEntryApplier.ClearFileGeneration(context, file);
-                    results.Add(HotReloadFileEntryApplier.BuildUnappliedResult(file));
-                    continue;
-                }
-
-                results.Add(
-                    HotReloadFileEntryApplier.ApplyFileAndBuildResult(
-                        context,
-                        file,
-                        compileResult,
-                        fileEntries.ToArray(),
-                        bindFailures));
+                results.Add(ApplyPreparedFile(context, compileResult, prepared));
             }
 
             return results;
+        }
+
+        private static HotReloadFileProcessResult ApplyPreparedFile(
+            HotReloadApplyContext context,
+            HotReloadShimCompileResult compileResult,
+            HotReloadPreparedGroupFile prepared)
+        {
+            HotReloadGroupFile file = prepared.File;
+            if (prepared.Kind == HotReloadGroupFilePreparationKind.SkippedByGroup)
+            {
+                return HotReloadFileEntryApplier.BuildUnappliedResult(file);
+            }
+
+            if (prepared.Kind == HotReloadGroupFilePreparationKind.NoEntriesToApply)
+            {
+                HotReloadFileEntryApplier.ClearFileGeneration(context, file);
+                return HotReloadFileEntryApplier.BuildUnappliedResult(file);
+            }
+
+            if (prepared.Kind == HotReloadGroupFilePreparationKind.ResolutionFailed)
+            {
+                return HotReloadFileEntryApplier.BuildResolutionFailedResult(
+                    context, file, prepared.Resolution);
+            }
+
+            return HotReloadFileEntryApplier.ApplyResolvedFileAndBuildResult(
+                context, file, compileResult, prepared.Entries, prepared.Resolution);
         }
 
         // Why only here and the empty-entries deactivation: a failed worker or shim compile
@@ -141,6 +145,32 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
             return revertedCount;
         }
 
+        /// <summary>
+        /// Peels every file's leftover patches on the methods the worker reported unchanged, and
+        /// records per file how many patches that removed.
+        /// </summary>
+        internal static void RevertUnchangedPatchesPerFile(
+            IReadOnlyList<HotReloadGroupFile> files,
+            HotReloadWorkerRowsByFile rows)
+        {
+            foreach (HotReloadGroupFile file in files)
+            {
+                IReadOnlyList<TransformWorkerUnchangedMethodDto> fileUnchanged =
+                    rows.UnchangedFor(file.ProjectRelativePath);
+                TransformWorkerUnchangedMethodDto[] unchangedMethods =
+                    new TransformWorkerUnchangedMethodDto[fileUnchanged.Count];
+                for (int index = 0; index < fileUnchanged.Count; index++)
+                {
+                    unchangedMethods[index] = fileUnchanged[index];
+                }
+
+                file.RevertedUnchangedCount = RevertUnchangedPatches(
+                    file.AssemblyName,
+                    unchangedMethods,
+                    file.Sinks.Outcomes,
+                    file.AssemblyResolvePath);
+            }
+        }
         /// <summary>
         /// Invokes each shim type's binder (emitted when the type carries at least one accessor
         /// delegate) once, before any patch is applied, so no delegation shim or added-method
