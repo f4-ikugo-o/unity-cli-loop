@@ -3176,6 +3176,215 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
             Assert.That(result.ErrorMessage, Does.Contain("null introduced type"));
         }
 
+        /// <summary>
+        /// Verifies that a success-shaped preparation response omitting the reuse rows is rejected,
+        /// because an omitted list is indistinguishable from a run that reused nothing and would
+        /// make a reload report a type it bound from an active artifact as introduced by nobody.
+        /// </summary>
+        [Test]
+        public void InterpretOutputJson_PrepareReusesOmitted_ReturnsFailure()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInput();
+
+            TransformWorkerClientResult result = TransformWorkerClient.InterpretOutputJson(
+                input,
+                "{\"shimSource\":\"\",\"files\":[{\"projectRelativePath\":\"Assets/Edited.cs\","
+                + "\"introducedTypes\":[],\"introducedTypeDiagnostics\":[]}]}");
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.ErrorMessage, Does.Contain("introducedTypeReuses"));
+        }
+
+        /// <summary>
+        /// Verifies that a null reuse row is rejected before a success-shaped response can reach
+        /// the group, because a null row carries no type to attribute the reuse to.
+        /// </summary>
+        [Test]
+        public void InterpretOutputJson_PrepareNullReuseRowJson_ReturnsFailure()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInput();
+
+            TransformWorkerClientResult result = TransformWorkerClient.InterpretOutputJson(
+                input,
+                "{\"files\":[{\"projectRelativePath\":\"Assets/Edited.cs\",\"introducedTypes\":[],"
+                + "\"introducedTypeDiagnostics\":[],\"introducedTypeReuses\":[null]}]}");
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.ErrorMessage, Does.Contain("null introduced type reuse"));
+        }
+
+        /// <summary>
+        /// Verifies that a reuse row without a metadata name is rejected, because the name is what
+        /// the reload reports the reuse under.
+        /// </summary>
+        [Test]
+        public void InterpretOutputJson_PrepareReuseWithoutMetadataName_ReturnsFailure()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInput();
+            TransformWorkerOutputDto output = CreatePreparationValidationOutput(
+                "Assembly",
+                "mvid",
+                "Assets/Edited.cs");
+            output.files[0].introducedTypeReuses = new[]
+            {
+                new TransformWorkerIntroducedTypeReuseDto
+                {
+                    metadataName = string.Empty,
+                    originalAssemblyName = "Assembly",
+                    originalAssemblyMvid = "mvid"
+                }
+            };
+
+            TransformWorkerClientResult result = TransformWorkerClient.InterpretOutputJson(
+                input,
+                JsonConvert.SerializeObject(output));
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.ErrorMessage, Does.Contain("reuse"));
+        }
+
+        /// <summary>
+        /// Verifies that a reuse row attributed to another assembly generation is rejected, so a
+        /// reload cannot report a reuse of a type that belongs to a generation it does not target.
+        /// </summary>
+        [Test]
+        public void InterpretOutputJson_PrepareReuseIdentityMismatch_ReturnsFailure()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInput();
+            TransformWorkerOutputDto output = CreatePreparationValidationOutput(
+                "Assembly",
+                "mvid",
+                "Assets/Edited.cs");
+            output.files[0].introducedTypeReuses = new[]
+            {
+                new TransformWorkerIntroducedTypeReuseDto
+                {
+                    metadataName = "Example.Introduced",
+                    originalAssemblyName = "Assembly",
+                    originalAssemblyMvid = "another-mvid"
+                }
+            };
+
+            TransformWorkerClientResult result = TransformWorkerClient.InterpretOutputJson(
+                input,
+                JsonConvert.SerializeObject(output));
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.ErrorMessage, Does.Contain("identity"));
+        }
+
+        /// <summary>
+        /// Verifies that a reuse of a type no retained artifact of the run holds is rejected, so a
+        /// reload cannot report a binding against an assembly this domain never retained.
+        /// </summary>
+        [Test]
+        public void InterpretOutputJson_PrepareReuseOfATypeNoArtifactHolds_ReturnsFailure()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInputWithRetainedType();
+            TransformWorkerOutputDto output = CreatePreparationValidationOutput(
+                "Assembly",
+                "mvid",
+                "Assets/Edited.cs");
+            output.files[0].introducedTypeReuses = new[]
+            {
+                new TransformWorkerIntroducedTypeReuseDto
+                {
+                    metadataName = "Example.NeverRetained",
+                    originalAssemblyName = "Assembly",
+                    originalAssemblyMvid = "mvid"
+                }
+            };
+
+            TransformWorkerClientResult result = TransformWorkerClient.InterpretOutputJson(
+                input,
+                JsonConvert.SerializeObject(output));
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.ErrorMessage, Does.Contain("retained"));
+        }
+
+        /// <summary>
+        /// Verifies that the same reuse reported twice is rejected, because each row becomes its
+        /// own response row and the reader would be told one declaration was bound twice.
+        /// </summary>
+        [Test]
+        public void InterpretOutputJson_PrepareRepeatsTheSameReuse_ReturnsFailure()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInputWithRetainedType();
+            TransformWorkerOutputDto output = CreatePreparationValidationOutput(
+                "Assembly",
+                "mvid",
+                "Assets/Edited.cs");
+            output.files[0].introducedTypeReuses = new[]
+            {
+                CreateRetainedTypeReuse(),
+                CreateRetainedTypeReuse()
+            };
+
+            TransformWorkerClientResult result = TransformWorkerClient.InterpretOutputJson(
+                input,
+                JsonConvert.SerializeObject(output));
+
+            Assert.That(result.Success, Is.False);
+            Assert.That(result.ErrorMessage, Does.Contain("more than once"));
+        }
+
+        /// <summary>
+        /// Verifies that a reuse of a type a retained artifact of the run does hold is accepted, so
+        /// the fail-closed check above does not refuse the case it exists to allow.
+        /// </summary>
+        [Test]
+        public void InterpretOutputJson_PrepareReuseOfARetainedType_Succeeds()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInputWithRetainedType();
+            TransformWorkerOutputDto output = CreatePreparationValidationOutput(
+                "Assembly",
+                "mvid",
+                "Assets/Edited.cs");
+            output.files[0].introducedTypeReuses = new[] { CreateRetainedTypeReuse() };
+
+            TransformWorkerClientResult result = TransformWorkerClient.InterpretOutputJson(
+                input,
+                JsonConvert.SerializeObject(output));
+
+            Assert.That(result.Success, Is.True, result.ErrorMessage);
+        }
+
+        private static TransformWorkerIntroducedTypeReuseDto CreateRetainedTypeReuse()
+        {
+            return new TransformWorkerIntroducedTypeReuseDto
+            {
+                metadataName = "Example.Retained",
+                originalAssemblyName = "Assembly",
+                originalAssemblyMvid = "mvid"
+            };
+        }
+
+        private static TransformWorkerInputDto CreatePreparationValidationInputWithRetainedType()
+        {
+            TransformWorkerInputDto input = CreatePreparationValidationInput();
+            input.introducedTypeArtifacts = new[]
+            {
+                new TransformWorkerIntroducedTypeArtifactDto
+                {
+                    assemblyFullName = "Artifact, Version=1.0.0.0",
+                    referencePath = "Artifact.dll",
+                    types = new[]
+                    {
+                        new TransformWorkerIntroducedTypeArtifactTypeDto
+                        {
+                            metadataName = "Example.Retained",
+                            originalAssemblyName = "Assembly",
+                            originalAssemblyMvid = "mvid",
+                            ownerProjectRelativePath = "Assets/Edited.cs",
+                            declarationFingerprint = "fingerprint"
+                        }
+                    }
+                }
+            };
+            return input;
+        }
+
         private static string CreateMatchingPreparationOutputJson(string assemblyName, string assemblyMvid)
         {
             return JsonConvert.SerializeObject(
@@ -3331,7 +3540,8 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                                 source = "public class Introduced { }"
                             }
                         },
-                        introducedTypeDiagnostics = Array.Empty<string>()
+                        introducedTypeDiagnostics = Array.Empty<string>(),
+                        introducedTypeReuses = Array.Empty<TransformWorkerIntroducedTypeReuseDto>()
                     }
                 }
             };

@@ -294,8 +294,9 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
 
         /// <summary>
         /// Verifies that a later reload which declares a type this domain already introduced
-        /// reuses the active type instead of introducing it again: the run succeeds, no second
-        /// artifact becomes active, and the caller it patches still reads through the one type.
+        /// reuses the active type instead of introducing it again: the run succeeds, reports the
+        /// declaration as already active, no second artifact becomes active, and the caller it
+        /// patches still reads through the one type.
         /// </summary>
         [Test]
         public async Task Run_SameTypeDeclaredAgainByALaterReload_ReusesTheActiveTypeWithoutIntroducingItAgain()
@@ -339,6 +340,19 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                         Is.Null,
                         "A reload that declares an already introduced type must not fail.");
                     AssertCallerIsPatched(second);
+
+                    HotReloadResponse response = HotReloadApplyResponseBuilder.Build(second, null);
+                    Assert.That(
+                        response.IntroducedTypes.Count,
+                        Is.EqualTo(1),
+                        "The second run bound one declaration from the active artifact.");
+                    Assert.That(
+                        response.IntroducedTypes[0].Kind,
+                        Is.EqualTo("AlreadyActive"),
+                        "A declaration bound from an active artifact was not introduced by this run.");
+                    Assert.That(
+                        response.IntroducedTypes[0].TypeName,
+                        Is.EqualTo(IntroducedTypeMetadataName));
                 }
 
                 Assert.That(
@@ -402,10 +416,18 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                         CreateRedefiningEdits(hostPath, callerPath));
 
                     Assert.That(
-                        FindFailureReason(second, "requires a compile"),
-                        Is.Not.Null,
+                        CountTypeFailures(second, "requires a compile"),
+                        Is.EqualTo(1),
                         "A redefined introduced type must fail the reload with a compile hint.\n"
                         + DescribeOutcomes(second));
+                    Assert.That(
+                        FindTypeFailureOwner(second, "requires a compile"),
+                        Does.EndWith(Path.GetFileName(hostPath)),
+                        "The refusal must name the file that redefines the type.");
+                    Assert.That(
+                        CountFailures(second, "requires a compile"),
+                        Is.EqualTo(0),
+                        "A type failure must not be reported a second time as a method row.");
                 }
 
                 Assert.That(
@@ -569,14 +591,14 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                     CreateDoubleDeclaringEdits(hostPath, callerPath));
 
                 Assert.That(
-                    FindFailureReason(result, "more than one file"),
-                    Is.Not.Null,
-                    "The run must report which type two files of the group declare. "
+                    CountTypeFailures(result, "more than one file"),
+                    Is.EqualTo(2),
+                    "Each file that declares the type must report the refusal. "
                         + DescribeOutcomes(result));
                 Assert.That(
                     CountFailures(result, "more than one file"),
-                    Is.EqualTo(2),
-                    "Both files of the refused group must report the refusal.");
+                    Is.EqualTo(0),
+                    "A type failure must not be reported a second time as a method row.");
                 Assert.That(
                     HotReloadIntroducedTypeHolder.Registry.ActiveCount,
                     Is.EqualTo(0),
@@ -585,6 +607,73 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                     HotReloadPatcher.ActivePatchCount,
                     Is.EqualTo(0),
                     "A refused group must apply no patch.");
+            }
+        }
+
+        /// <summary>
+        /// Verifies that a type declared by three files of one group is refused against all three,
+        /// instead of naming only the first pair and hiding the third file.
+        /// </summary>
+        [Test]
+        public async Task Run_SameTypeDeclaredByThreeFilesOfAGroup_ReportsEveryOwner()
+        {
+            string hostPath = FixturePath("HotReloadCrossFileAddedMemberHost.cs");
+            string callerPath = FixturePath("HotReloadCrossFileAddedMemberCaller.cs");
+            string holderPath = FixturePath("HotReloadCrossFileAddedMemberHolder.cs");
+
+            using (HotReloadIntroducedTypeHolder.BeginReplacement())
+            {
+                HotReloadIntroducedTypeHolder.Initialize();
+                HotReloadOrchestratorResult result = await HotReloadOrchestrator.RunAsync(
+                    new[] { hostPath, callerPath, holderPath },
+                    contentPathOverride: null,
+                    CancellationToken.None,
+                    CreateTripleDeclaringEdits(hostPath, callerPath, holderPath));
+
+                Assert.That(
+                    CountTypeFailures(result, "more than one file"),
+                    Is.EqualTo(3),
+                    "Every file that declares the type must report the refusal. "
+                        + DescribeOutcomes(result));
+                Assert.That(
+                    HotReloadIntroducedTypeHolder.Registry.ActiveCount,
+                    Is.EqualTo(0),
+                    "A refused group must activate no type.");
+            }
+        }
+
+        /// <summary>
+        /// Verifies that a group double-declaring two types reports every refused declaration,
+        /// instead of stopping at the first repeated one and leaving the second unreported.
+        /// </summary>
+        [Test]
+        public async Task Run_TwoTypesEachDeclaredByTwoFilesOfAGroup_ReportsEveryRefusal()
+        {
+            string hostPath = FixturePath("HotReloadCrossFileAddedMemberHost.cs");
+            string callerPath = FixturePath("HotReloadCrossFileAddedMemberCaller.cs");
+
+            using (HotReloadIntroducedTypeHolder.BeginReplacement())
+            {
+                HotReloadIntroducedTypeHolder.Initialize();
+                HotReloadOrchestratorResult result = await HotReloadOrchestrator.RunAsync(
+                    new[] { hostPath, callerPath },
+                    contentPathOverride: null,
+                    CancellationToken.None,
+                    CreateTwiceDoubleDeclaringEdits(hostPath, callerPath));
+
+                Assert.That(
+                    CountTypeFailures(result, "more than one file"),
+                    Is.EqualTo(4),
+                    "Both files must report the refusal of both types. " + DescribeOutcomes(result));
+                Assert.That(
+                    CountTypeFailures(result, "HotReloadCrossFileDoubleDeclaredSecond"),
+                    Is.EqualTo(2),
+                    "The second double-declared type must be named as well. "
+                        + DescribeOutcomes(result));
+                Assert.That(
+                    HotReloadIntroducedTypeHolder.Registry.ActiveCount,
+                    Is.EqualTo(0),
+                    "A refused group must activate no type.");
             }
         }
 
@@ -815,6 +904,35 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
             }
 
             return count;
+        }
+
+        private static int CountTypeFailures(HotReloadOrchestratorResult result, string reasonFragment)
+        {
+            int count = 0;
+            foreach (HotReloadIntroducedTypeOutcome outcome in result.IntroducedTypes)
+            {
+                if (outcome.Kind == HotReloadIntroducedTypeOutcomeKind.Failed
+                    && outcome.Reason.Contains(reasonFragment, StringComparison.Ordinal))
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+
+        private static string FindTypeFailureOwner(HotReloadOrchestratorResult result, string reasonFragment)
+        {
+            foreach (HotReloadIntroducedTypeOutcome outcome in result.IntroducedTypes)
+            {
+                if (outcome.Kind == HotReloadIntroducedTypeOutcomeKind.Failed
+                    && outcome.Reason.Contains(reasonFragment, StringComparison.Ordinal))
+                {
+                    return outcome.OwnerProjectRelativePath;
+                }
+            }
+
+            return null;
         }
 
         private static string FindFailureReason(HotReloadOrchestratorResult result, string reasonFragment)
@@ -1334,8 +1452,15 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                 {
                     stages.Add(PrepareStage);
                     return Task.FromResult(
-                        HotReloadIntroducedTypePreparationResult.Failure(
-                            "The introduced type artifact could not be compiled."));
+                        HotReloadIntroducedTypePreparationResult.TypeFailures(
+                            new[]
+                            {
+                                HotReloadIntroducedTypeOutcome.Failed(
+                                    string.Empty,
+                                    string.Empty,
+                                    string.Empty,
+                                    "The introduced type artifact could not be compiled.")
+                            }));
                 },
                 (input, ct) =>
                 {
@@ -1383,6 +1508,9 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
         private const string HostTypeAnchor = "    public sealed class HotReloadCrossFileAddedMemberHost";
 
         private const string CallerBodyAnchor = "return host.Value();";
+
+        private const string HolderTypeAnchor =
+            "    internal sealed class HotReloadCrossFileAddedMemberHolder";
 
         private const string CallerTypeAnchor =
             "    internal sealed class HotReloadCrossFileAddedMemberCaller";
@@ -1593,6 +1721,79 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
 
         // Both files of the group declare the same type, which is what makes the group offer the
         // artifact batch two records of one identity.
+        private static Dictionary<string, string> CreateTripleDeclaringEdits(
+            string hostPath,
+            string callerPath,
+            string holderPath)
+        {
+            string introduced = BuildDoubleDeclaredSource("HotReloadCrossFileTripleDeclared");
+            string hostSource = File.ReadAllText(hostPath);
+            string callerSource = File.ReadAllText(callerPath);
+            string holderSource = File.ReadAllText(holderPath);
+            Assert.That(hostSource, Does.Contain(HostTypeAnchor), "Precondition: host type anchor must exist.");
+            Assert.That(
+                callerSource,
+                Does.Contain(CallerTypeAnchor),
+                "Precondition: caller type anchor must exist.");
+            Assert.That(
+                holderSource,
+                Does.Contain(HolderTypeAnchor),
+                "Precondition: holder type anchor must exist.");
+            return new Dictionary<string, string>
+            {
+                [hostPath] = HotReloadTestSourceWriter.WriteEditedSource(
+                    "IntroducedTypeTripleDeclaredHost.cs",
+                    hostSource.Replace(HostTypeAnchor, introduced + HostTypeAnchor, StringComparison.Ordinal)),
+                [callerPath] = HotReloadTestSourceWriter.WriteEditedSource(
+                    "IntroducedTypeTripleDeclaredCaller.cs",
+                    callerSource.Replace(
+                        CallerTypeAnchor, introduced + CallerTypeAnchor, StringComparison.Ordinal)),
+                [holderPath] = HotReloadTestSourceWriter.WriteEditedSource(
+                    "IntroducedTypeTripleDeclaredHolder.cs",
+                    holderSource.Replace(
+                        HolderTypeAnchor, introduced + HolderTypeAnchor, StringComparison.Ordinal))
+            };
+        }
+
+        // Why two duplicated types and not a third file: the group only has to hold more than one
+        // repeated identity for a collector that stops at the first one to lose the rest.
+        private static Dictionary<string, string> CreateTwiceDoubleDeclaringEdits(
+            string hostPath,
+            string callerPath)
+        {
+            string callerSource = File.ReadAllText(callerPath);
+            Assert.That(
+                callerSource,
+                Does.Contain(CallerTypeAnchor),
+                "Precondition: caller type anchor must exist.");
+            string hostSource = File.ReadAllText(hostPath);
+            Assert.That(hostSource, Does.Contain(HostTypeAnchor), "Precondition: host type anchor must exist.");
+            string introduced = BuildDoubleDeclaredSource("HotReloadCrossFileDoubleDeclaredFirst")
+                + BuildDoubleDeclaredSource("HotReloadCrossFileDoubleDeclaredSecond");
+            return new Dictionary<string, string>
+            {
+                [hostPath] = HotReloadTestSourceWriter.WriteEditedSource(
+                    "IntroducedTypeTwiceDoubleDeclaredHost.cs",
+                    hostSource.Replace(HostTypeAnchor, introduced + HostTypeAnchor, StringComparison.Ordinal)),
+                [callerPath] = HotReloadTestSourceWriter.WriteEditedSource(
+                    "IntroducedTypeTwiceDoubleDeclaredCaller.cs",
+                    callerSource.Replace(
+                        CallerTypeAnchor, introduced + CallerTypeAnchor, StringComparison.Ordinal))
+            };
+        }
+
+        private static string BuildDoubleDeclaredSource(string typeName)
+        {
+            return "    public sealed class " + typeName + "\n"
+                + "    {\n"
+                + "        public int Read()\n"
+                + "        {\n"
+                + "            return 7;\n"
+                + "        }\n"
+                + "    }\n"
+                + "\n";
+        }
+
         private static Dictionary<string, string> CreateDoubleDeclaringEdits(
             string hostPath,
             string callerPath)

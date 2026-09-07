@@ -23,6 +23,9 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
             HotReloadAutoRefreshHoldResponseEnricher.AppendSceneRefreshWarning(
                 warnings,
                 hold.SceneRefreshWarning);
+            // Why one snapshot: the total and the sentence that names it must agree, and a second
+            // read could answer after another reload activated a type.
+            int introducedTypeCount = HotReloadActiveChangeCounts.IntroducedTypeCount;
             return new HotReloadResponse
             {
                 Success = true,
@@ -30,9 +33,15 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
                 ActivePatchTotal = HotReloadPatcher.ActiveChangeCount,
                 AutoRefreshHeld = hold.Held,
                 Warnings = warnings,
-                Message = clearedCount == 0
-                    ? "No active hot-reload changes to revert."
-                    : "Reverted all active hot-reload changes."
+                // Why the rows too: a total without them names nothing, so a caller told that
+                // types stayed loaded could not tell which ones a revert left behind.
+                IntroducedTypes = HotReloadIntroducedTypeStatusSection.BuildActiveRows(),
+                ActiveIntroducedTypeTotal = introducedTypeCount,
+                Message = HotReloadIntroducedTypeStatusSection.AppendRevertAllNote(
+                    clearedCount == 0
+                        ? "No active hot-reload changes to revert."
+                        : "Reverted all active hot-reload changes.",
+                    introducedTypeCount)
             };
         }
 
@@ -114,6 +123,8 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
                 Success = true,
                 Methods = methods,
                 Warnings = warnings,
+                IntroducedTypes = HotReloadIntroducedTypeStatusSection.BuildActiveRows(),
+                ActiveIntroducedTypeTotal = HotReloadActiveChangeCounts.IntroducedTypeCount,
                 ActivePatchTotal = count,
                 AddedFieldTotal = addedFields.Count,
                 AutoRefreshHeld = hold.Held,

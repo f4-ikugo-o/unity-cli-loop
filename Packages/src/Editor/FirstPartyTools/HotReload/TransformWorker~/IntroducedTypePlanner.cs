@@ -151,10 +151,23 @@ internal static class IntroducedTypePlanner
         // can do, so a redefined introduced type is reported instead of being introduced again.
         if (!string.Equals(activeFingerprint, declarationFingerprint, StringComparison.Ordinal))
         {
+            // The editor side recognises this text by its prefix and reads the type name back out
+            // of the tail (HotReloadConstants.ChangedIntroducedTypeDiagnosticPrefix), so changing
+            // the wording here means changing that constant in the same edit.
             unit.IntroducedTypeDiagnostics.Add(
                 "Changed introduced type requires a compile: " + metadataName);
+            return true;
         }
 
+        // Why recorded: the run binds this declaration from the active artifact, and without a
+        // record the reload could not tell that from a run that never saw the declaration.
+        unit.IntroducedTypeReuses.Add(
+            new WorkerIntroducedTypeReuse
+            {
+                MetadataName = metadataName,
+                OriginalAssemblyName = targetAssemblyName ?? string.Empty,
+                OriginalAssemblyMvid = targetAssemblyMvid ?? string.Empty
+            });
         return true;
     }
 
