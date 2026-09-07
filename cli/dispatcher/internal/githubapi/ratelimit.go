@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	clierrors "github.com/hatayama/unity-cli-loop/common/errors"
 )
 
 const (
@@ -24,7 +26,7 @@ const (
 
 // tokenNextAction tells the user how to move from the shared anonymous quota
 // to their own authenticated one.
-const tokenNextAction = "Set GH_TOKEN (or GITHUB_TOKEN) to a GitHub token so uloop uses your authenticated API quota, then retry."
+const tokenNextAction = "Set GH_TOKEN (or GITHUB_TOKEN) to a GitHub token, or run `gh auth login` so uloop can use the gh CLI's token, then retry."
 
 // RateLimitError reports that GitHub refused a REST API request because the
 // caller's request quota is exhausted. Anonymous quota is shared by every
@@ -64,6 +66,31 @@ func (e RateLimitError) NextActions() []string {
 		return append(actions, "Or: "+secondaryLimitFallbackWait)
 	}
 	return append(actions, "Or retry after "+e.ResetAt.Local().Format(resetTimeLayout)+" when the anonymous quota resets.")
+}
+
+// ToCLIError lets ClassifyError turn a rate-limited GitHub call into an
+// envelope that names the recovery (a token, or the reset time) instead of the
+// generic "fix the local environment" guidance. Every WriteClassifiedError path
+// that wraps this error reaches it through errors.As, so the guidance no longer
+// has to be re-attached at each call site.
+func (e RateLimitError) ToCLIError(context clierrors.ErrorContext) clierrors.CLIError {
+	details := map[string]any{}
+	if !e.ResetAt.IsZero() {
+		details["GitHubRateLimitResetAt"] = e.ResetAt.UTC().Format(time.RFC3339)
+	}
+	return clierrors.CLIError{
+		ErrorCode: clierrors.ErrorCodeInternalError,
+		Phase:     clierrors.ErrorPhaseExecution,
+		Message:   e.Error(),
+		// Why retryable: the refused request was a GET with no side effects, and
+		// the quota recovers on its own once the reset time passes.
+		Retryable:   true,
+		SafeToRetry: true,
+		ProjectRoot: context.ProjectRoot,
+		Command:     context.Command,
+		NextActions: e.NextActions(),
+		Details:     details,
+	}
 }
 
 // DetectRateLimit classifies a non-2xx response. GitHub signals an exhausted

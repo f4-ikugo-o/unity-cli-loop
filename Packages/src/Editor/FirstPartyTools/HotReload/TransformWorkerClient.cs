@@ -14,13 +14,18 @@ using Debug = UnityEngine.Debug;
 namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
 {
     /// <summary>
-    /// Runs the cached transform worker with file-path JSON I/O (UTF-8, no BOM).
+    /// Runs transform requests through the resident worker host, falling back to a single one-shot
+    /// worker process when the resident conversation cannot be held.
     /// </summary>
     internal static class TransformWorkerClient
     {
+        // Why a test seam on a static class: the client has no instance to inject into, and the
+        // resident host must be replaceable so routing tests do not depend on the real worker.
+        internal static TransformWorkerHost HostOverrideForTests;
+
         /// <summary>
-        /// Bootstraps the worker if needed, writes <paramref name="input"/> to a temp JSON file,
-        /// runs <c>dotnet worker.dll &lt;in&gt; &lt;out&gt;</c>, and deserializes the output.
+        /// Transforms <paramref name="input"/> through the resident worker, and only when two fresh
+        /// resident processes broke the conversation, once more through a one-shot worker process.
         /// </summary>
         public static async Task<TransformWorkerClientResult> RunAsync(
             TransformWorkerInputDto input,
@@ -42,13 +47,51 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
         }
 
         /// <summary>
-        /// Runs the worker on a request that has already been checked, without checking it again.
+        /// Runs the worker on a request that has already been checked, without checking it again:
+        /// through the resident host, and only when two fresh resident processes broke the
+        /// conversation, once more through a one-shot worker process.
         /// </summary>
         // Why separate from RunAsync: the worker consumes the request JSON as a boundary of its
         // own and has to refuse a record it cannot act on even when the request did not come from
         // this client. Its guard can only be shown by handing it a request this client would have
         // refused first.
         internal static async Task<TransformWorkerClientResult> RunWorkerAsync(
+            TransformWorkerInputDto input,
+            CancellationToken ct)
+        {
+            TransformWorkerHost host = HostOverrideForTests ?? TransformWorkerHost.Shared;
+            TransformWorkerHostResult hostResult = await host.RunAsync(input, ct).ConfigureAwait(false);
+            if (hostResult.Kind == TransformWorkerHostResultKind.Completed)
+            {
+                // Why the resident output is interpreted here and not inside the host: the host
+                // hands back the document as the worker wrote it, and the ordered boundary checks
+                // are what turn it into a result. Keeping them on this side is also what stops a
+                // replaced host from returning an output that never met them.
+                return InterpretOutput(input, hostResult.Output);
+            }
+
+            // WorkerFailed, TimedOut, BootstrapFailed and LifecycleClosed describe the request or a
+            // deliberate stop, so repeating them on a one-shot process only costs time.
+            if (hostResult.Kind != TransformWorkerHostResultKind.RetryExhausted)
+            {
+                return TransformWorkerClientResult.Failure(hostResult.ErrorMessage);
+            }
+
+            // Why fall back only here: two fresh processes broke the conversation without the worker
+            // reporting anything, so the resident path itself is suspect and a one-shot process is
+            // the only way to still serve this run.
+            VibeLogger.LogWarning(
+                HotReloadConstants.VibeLogWorkerHostFallbackOneShot,
+                "Resident transform worker conversation broke twice; running this request as a one-shot process.",
+                new { reason = hostResult.ErrorMessage });
+            return await RunOneShotAsync(input, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Bootstraps the worker if needed, writes <paramref name="input"/> to a temp JSON file, runs
+        /// <c>dotnet worker.dll &lt;in&gt; &lt;out&gt;</c> once, and deserializes the output.
+        /// </summary>
+        private static async Task<TransformWorkerClientResult> RunOneShotAsync(
             TransformWorkerInputDto input,
             CancellationToken ct)
         {
@@ -96,16 +139,15 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
                         + "\nstderr:\n" + standardError);
                 }
 
-                if (!File.Exists(outputJsonPath))
+                TransformWorkerOutputDto output = TransformWorkerOutputReader.TryRead(
+                    outputJsonPath,
+                    out string readError);
+                if (output == null)
                 {
-                    return TransformWorkerClientResult.Failure(
-                        "Transform worker did not produce an output JSON file.");
+                    return TransformWorkerClientResult.Failure(readError);
                 }
 
-                string outputJson = File.ReadAllText(
-                    outputJsonPath,
-                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-                return InterpretOutputJson(input, outputJson);
+                return InterpretOutput(input, output);
             }
             finally
             {
@@ -205,23 +247,37 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
         }
 
         /// <summary>
-        /// Turns one worker output JSON document into the client result, applying the boundary
-        /// checks in the order the process path depends on.
+        /// Turns one worker output JSON document into the client result: deserializes it, then
+        /// applies the same ordered checks every path meets.
         /// </summary>
-        // Why internal and separate from RunAsync: the order matters as much as the checks. The
-        // required-output check has to see the omissions before coalescing replaces them with
-        // empty arrays, so a test that calls the checks directly cannot tell whether RunAsync
-        // still performs them at all.
+        // Why internal and separate from RunAsync: the order matters as much as the checks, and a
+        // test that calls the checks directly cannot tell whether the run still performs them.
         internal static TransformWorkerClientResult InterpretOutputJson(
             TransformWorkerInputDto input,
             string outputJson)
         {
-            TransformWorkerOutputDto output = JsonConvert.DeserializeObject<TransformWorkerOutputDto>(outputJson);
+            TransformWorkerOutputDto output =
+                TransformWorkerOutputReader.TryDeserialize(outputJson, out string deserializeError);
             if (output == null)
             {
-                return TransformWorkerClientResult.Failure(
-                    "Failed to deserialize transform worker output JSON.");
+                return TransformWorkerClientResult.Failure(deserializeError);
             }
+
+            return InterpretOutput(input, output);
+        }
+
+        /// <summary>
+        /// Turns one worker output document into the client result, applying the boundary checks in
+        /// the order the process path depends on.
+        /// </summary>
+        // Why every path meets this and nothing before it: the required-output check has to see the
+        // omissions before coalescing replaces them with empty arrays, so the checks live here
+        // rather than in whatever read the document.
+        internal static TransformWorkerClientResult InterpretOutput(
+            TransformWorkerInputDto input,
+            TransformWorkerOutputDto output)
+        {
+            Debug.Assert(output != null, "output must not be null.");
 
             if (!TryValidateRequiredPreparationOutput(input, output, out string preparationError))
             {

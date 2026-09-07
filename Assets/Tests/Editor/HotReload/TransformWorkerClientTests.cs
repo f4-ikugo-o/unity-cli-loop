@@ -94,6 +94,7 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
         }
 
         private const string TestAssemblyName = "UnityCLILoop.Tests.Editor.HotReload";
+        private const int SelfSnapshotConcurrency = 4;
         private const string ExpectedListEnumeratorFullName =
             "System.Collections.Generic.List`1/Enumerator<System.Int32>";
 
@@ -586,74 +587,33 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
             string[] sourcePaths = Directory.GetFiles(directory, "*.cs", SearchOption.TopDirectoryOnly);
             Assert.That(sourcePaths.Length, Is.GreaterThan(0), "Expected at least one HotReload test .cs file.");
 
-            List<string> failures = new List<string>();
+            // Why warm up first: EnsureWorkerAsync compiles into a shared cache directory on a
+            // miss, and concurrent first-time misses would race on the same output files.
+            TransformWorkerBootstrapResult bootstrap =
+                await TransformWorkerBootstrap.EnsureWorkerAsync(CancellationToken.None);
+            Assert.That(bootstrap.Success, Is.True, "Worker bootstrap failed: " + bootstrap.ErrorMessage);
+
+            // Why bounded concurrency: each file costs one ~0.4 s worker process spawn, and with
+            // ~100 files the sequential version alone took 50 s of the suite. Four in flight keeps
+            // the wall time near 1/4 without starving the Editor main thread, which every run
+            // still hops through for CompilationPipeline and compiler-path lookups.
+            using SemaphoreSlim slots = new SemaphoreSlim(SelfSnapshotConcurrency, SelfSnapshotConcurrency);
+            List<Task<string>> fileChecks = new List<Task<string>>(sourcePaths.Length);
             foreach (string sourcePath in sourcePaths)
             {
-                string fullPath = Path.GetFullPath(sourcePath);
-                string projectRelativePath =
-                    "Assets/Tests/Editor/HotReload/" + Path.GetFileName(fullPath);
-                string onDisk = File.ReadAllText(fullPath);
-                // Why skip: a global-using-only file has no methods to mark unchanged; the worker
-                // correctly emits empty entries/skipped/unchanged for it.
-                if (!ContainsTypeDeclaration(onDisk))
+                fileChecks.Add(CheckSelfSnapshotTreatsFileUnchangedAsync(Path.GetFullPath(sourcePath), slots));
+            }
+
+            string[] fileOutcomes = await Task.WhenAll(fileChecks);
+
+            // Why keep source order: the report must list files the same way the sequential loop
+            // did, independent of which worker process happened to finish first.
+            List<string> failures = new List<string>();
+            foreach (string fileOutcome in fileOutcomes)
+            {
+                if (fileOutcome != null)
                 {
-                    continue;
-                }
-
-                bool isMethodlessTypeAllowListed =
-                    IsSelfSnapshotMethodlessTypeAllowListed(Path.GetFileName(fullPath));
-
-                TransformWorkerClientResult result = await RunWorkerOnSourceAsync(
-                    fullPath,
-                    projectRelativePath,
-                    snapshotSource: onDisk);
-
-                List<string> fileFailures = new List<string>();
-                if (!result.Success)
-                {
-                    fileFailures.Add("Success=false: " + result.ErrorMessage);
-                }
-
-                if (result.Output == null)
-                {
-                    fileFailures.Add("Output is null");
-                    failures.Add(projectRelativePath + " -> " + string.Join("; ", fileFailures));
-                    continue;
-                }
-
-                if (result.Output.files[0].parseErrors != null && result.Output.files[0].parseErrors.Length > 0)
-                {
-                    fileFailures.Add(
-                        "parseErrors=[" + string.Join(" | ", result.Output.files[0].parseErrors) + "]");
-                }
-
-                if (result.Output.entries != null && result.Output.entries.Length > 0)
-                {
-                    fileFailures.Add(
-                        "entries=[" + FormatEntryMethodNames(result.Output.entries) + "]");
-                }
-
-                int unchangedCount =
-                    result.Output.unchangedMethods != null ? result.Output.unchangedMethods.Length : 0;
-                int skippedCount = result.Output.skipped != null ? result.Output.skipped.Length : 0;
-                if (!isMethodlessTypeAllowListed && unchangedCount + skippedCount < 1)
-                {
-                    fileFailures.Add(
-                        "unchangedMethods+skipped < 1 (unchanged="
-                        + unchangedCount + ", skipped=" + skippedCount + ")");
-                }
-
-                if (result.Output.files[0].declarationDriftWarnings != null
-                    && result.Output.files[0].declarationDriftWarnings.Length > 0)
-                {
-                    fileFailures.Add(
-                        "declarationDriftWarnings=["
-                        + string.Join(" | ", result.Output.files[0].declarationDriftWarnings) + "]");
-                }
-
-                if (fileFailures.Count > 0)
-                {
-                    failures.Add(projectRelativePath + " -> " + string.Join("; ", fileFailures));
+                    failures.Add(fileOutcome);
                 }
             }
 
@@ -662,6 +622,100 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                 Is.Empty,
                 "Self-snapshot must treat every HotReload test source as unchanged:\n"
                 + string.Join("\n", failures));
+        }
+
+        /// <summary>
+        /// Runs the worker on one HotReload test source with itself as the snapshot and returns
+        /// the per-file failure line ("path -> reason; reason"), or null when the file passes or
+        /// has no type declaration.
+        /// </summary>
+        private static async Task<string> CheckSelfSnapshotTreatsFileUnchangedAsync(
+            string fullPath,
+            SemaphoreSlim slots)
+        {
+            string projectRelativePath =
+                "Assets/Tests/Editor/HotReload/" + Path.GetFileName(fullPath);
+            string onDisk = File.ReadAllText(fullPath);
+            // Why skip: a global-using-only file has no methods to mark unchanged; the worker
+            // correctly emits empty entries/skipped/unchanged for it.
+            if (!ContainsTypeDeclaration(onDisk))
+            {
+                return null;
+            }
+
+            bool isMethodlessTypeAllowListed =
+                IsSelfSnapshotMethodlessTypeAllowListed(Path.GetFileName(fullPath));
+
+            await slots.WaitAsync();
+            TransformWorkerClientResult result;
+            try
+            {
+                result = await RunWorkerOnSourceAsync(
+                    fullPath,
+                    projectRelativePath,
+                    snapshotSource: onDisk);
+            }
+            finally
+            {
+                slots.Release();
+            }
+
+            List<string> fileFailures = DescribeSelfSnapshotFailures(result, isMethodlessTypeAllowListed);
+            if (fileFailures.Count == 0)
+            {
+                return null;
+            }
+
+            return projectRelativePath + " -> " + string.Join("; ", fileFailures);
+        }
+
+        private static List<string> DescribeSelfSnapshotFailures(
+            TransformWorkerClientResult result,
+            bool isMethodlessTypeAllowListed)
+        {
+            List<string> fileFailures = new List<string>();
+            if (!result.Success)
+            {
+                fileFailures.Add("Success=false: " + result.ErrorMessage);
+            }
+
+            if (result.Output == null)
+            {
+                fileFailures.Add("Output is null");
+                return fileFailures;
+            }
+
+            if (result.Output.files[0].parseErrors != null && result.Output.files[0].parseErrors.Length > 0)
+            {
+                fileFailures.Add(
+                    "parseErrors=[" + string.Join(" | ", result.Output.files[0].parseErrors) + "]");
+            }
+
+            if (result.Output.entries != null && result.Output.entries.Length > 0)
+            {
+                fileFailures.Add(
+                    "entries=[" + FormatEntryMethodNames(result.Output.entries) + "]");
+            }
+
+            int unchangedCount =
+                result.Output.unchangedMethods != null ? result.Output.unchangedMethods.Length : 0;
+            int skippedCount = result.Output.skipped != null ? result.Output.skipped.Length : 0;
+            if (!isMethodlessTypeAllowListed && unchangedCount + skippedCount < 1)
+            {
+                fileFailures.Add(
+                    "unchangedMethods+skipped < 1 (unchanged="
+                    + unchangedCount + ", skipped=" + skippedCount + ")");
+            }
+
+            if (result.Output.files[0].declarationDriftWarnings != null
+                && result.Output.files[0].declarationDriftWarnings.Length > 0)
+            {
+                fileFailures.Add(
+                    "declarationDriftWarnings=["
+                    + string.Join(" | ", result.Output.files[0].declarationDriftWarnings) + "]");
+            }
+
+            return fileFailures;
         }
 
         /// <summary>
@@ -1085,22 +1139,20 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
             Assert.That(foundCompute, Is.True, "Body edit must still emit a Patched ComputeWithPrivate entry.");
         }
 
-        private const string ExpectedAddedPropertySkipReason =
-            "Added properties are out of scope for hot reload; the compiled assembly has no such member. "
-            + "For a computed value, add a same-file method instead (e.g. 'private T GetX()'), which applies "
-            + "through hot reload; for a constant, use a 'const' or a plain added field; otherwise run "
-            + "'uloop compile'.";
-
         private const string ExpectedExplicitAccessorSkipReason =
             "Property setter, init, or indexer accessors are out of scope for v1; "
             + "run 'uloop compile' to apply accessor edits.";
 
+        private const string ExpectedSetOnlyPropertySkipReason =
+            "Added properties with only a setter are skipped; the shim requires a getter identity. "
+            + "Run 'uloop compile' to add them.";
+
         /// <summary>
-        /// What: adding a get-accessor property plus a method-body edit skips the getter with
-        /// the added-property reason and does not emit the outside-body drift warning.
+        /// What: adding an expression-bodied property plus a method-body edit emits the getter
+        /// as an added member and does not emit the outside-body drift warning.
         /// </summary>
         [Test]
-        public async Task Run_AddedExpressionBodiedPropertyPlusBodyEdit_SkipsGetterWithoutOutsideBodyWarning()
+        public async Task Run_AddedExpressionBodiedPropertyPlusBodyEdit_EmitsGetterWithoutOutsideBodyWarning()
         {
             const string fileName = "AddedExpressionBodiedPropertyDrift.cs";
             TransformWorkerClientResult result = await RunWorkerOnEditedE2ECopyAsync(
@@ -1117,14 +1169,14 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                         StringComparison.Ordinal);
                 });
 
-            AssertSkippedContains(result, "get_AddedProbe", ExpectedAddedPropertySkipReason);
+            AssertEmittedWithoutSkip(result, "get_AddedProbe");
             AssertDoesNotContainOutsideMethodBodyDriftWarning(result, fileName);
             AssertPatchedComputeWithPrivate(result);
         }
 
         /// <summary>
-        /// What: adding a setter-only property plus a method-body edit skips the setter with
-        /// the explicit-accessor reason and does not emit the outside-body drift warning.
+        /// What: adding a setter-only property plus a method-body edit skips the setter, because
+        /// an added property needs a getter identity, and does not emit the outside-body warning.
         /// </summary>
         [Test]
         public async Task Run_AddedSetterOnlyPropertyPlusBodyEdit_SkipsSetterWithoutOutsideBodyWarning()
@@ -1144,17 +1196,17 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                         StringComparison.Ordinal);
                 });
 
-            AssertSkippedContains(result, "set_AddedSetterOnly", ExpectedExplicitAccessorSkipReason);
+            AssertSkippedContains(result, "set_AddedSetterOnly", ExpectedSetOnlyPropertySkipReason);
             AssertDoesNotContainOutsideMethodBodyDriftWarning(result, fileName);
             AssertPatchedComputeWithPrivate(result);
         }
 
         /// <summary>
-        /// What: adding an auto-property plus a method-body edit skips the getter with the
-        /// added-property reason and does not emit the outside-body drift warning.
+        /// What: adding an auto-property plus a method-body edit emits both accessors as added
+        /// members and does not emit the outside-body drift warning.
         /// </summary>
         [Test]
-        public async Task Run_AddedAutoPropertyPlusBodyEdit_SkipsGetterWithoutOutsideBodyWarning()
+        public async Task Run_AddedAutoPropertyPlusBodyEdit_EmitsAccessorsWithoutOutsideBodyWarning()
         {
             const string fileName = "AddedAutoPropertyDrift.cs";
             TransformWorkerClientResult result = await RunWorkerOnEditedE2ECopyAsync(
@@ -1171,7 +1223,8 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                         StringComparison.Ordinal);
                 });
 
-            AssertSkippedContains(result, "get_AddedAuto", ExpectedAddedPropertySkipReason);
+            AssertEmittedWithoutSkip(result, "get_AddedAuto");
+            AssertEmittedWithoutSkip(result, "set_AddedAuto");
             AssertDoesNotContainOutsideMethodBodyDriftWarning(result, fileName);
             AssertPatchedComputeWithPrivate(result);
         }
@@ -2263,6 +2316,24 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                 + string.Join("\n", warnings));
         }
 
+        private static void AssertEmittedWithoutSkip(
+            TransformWorkerClientResult result,
+            string methodName)
+        {
+            bool found = false;
+            foreach (TransformWorkerEntryDto entry in result.Output.entries)
+            {
+                if (entry.methodName == methodName)
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            Assert.That(found, Is.True, "Expected an entry for '" + methodName + "'.");
+            AssertSkippedDoesNotContain(result, methodName);
+        }
+
         private static void AssertSkippedContains(
             TransformWorkerClientResult result,
             string methodFragment,
@@ -2371,6 +2442,37 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
             string secondProjectRelativePath = null,
             string operation = null)
         {
+            TransformWorkerInputDto input = BuildInputForSource(
+                sourcePath,
+                projectRelativePath,
+                snapshotSource,
+                additionalAssemblySourcePaths,
+                changedSiblingSourcePaths,
+                secondSourcePath,
+                secondProjectRelativePath,
+                operation);
+            return await TransformWorkerClient.RunAsync(input, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Builds a worker input for the e2e fixture source with this test assembly as the target.
+        /// Shared with the resident-worker host tests so they exercise the real worker on the same input.
+        /// </summary>
+        internal static TransformWorkerInputDto BuildE2EFixtureInput()
+        {
+            return BuildInputForSource(ResolveE2EFixturePath(), ResolveE2EFixtureProjectRelativePath());
+        }
+
+        private static TransformWorkerInputDto BuildInputForSource(
+            string sourcePath,
+            string projectRelativePath,
+            string snapshotSource = null,
+            string[] additionalAssemblySourcePaths = null,
+            string[] changedSiblingSourcePaths = null,
+            string secondSourcePath = null,
+            string secondProjectRelativePath = null,
+            string operation = null)
+        {
             string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
             string targetDllPath = Path.Combine(
                 projectRoot,
@@ -2440,7 +2542,7 @@ namespace io.github.hatayama.UnityCliLoop.Tests.Editor.HotReload
                 changedSiblingSourcePaths = changedSiblingSourcePaths
             };
 
-            return await TransformWorkerClient.RunAsync(input, CancellationToken.None);
+            return input;
         }
 
         private static string[] BuildAbsoluteReferencePaths(
