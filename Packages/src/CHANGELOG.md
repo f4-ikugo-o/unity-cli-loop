@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.5.1](https://github.com/hatayama/unity-cli-loop/compare/v3.5.0...v3.5.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* find-game-objects retry hint now shows search modes in the documented lowercase spelling ([#2661](https://github.com/hatayama/unity-cli-loop/issues/2661)) ([7d421e1](https://github.com/hatayama/unity-cli-loop/commit/7d421e10c1ee886d52d8db1561793fa3ba737838))
+
 ## [3.5.0](https://github.com/hatayama/unity-cli-loop/compare/v3.4.0...v3.5.0) (2026-09-07)
 
 

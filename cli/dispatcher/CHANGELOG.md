@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.4.1](https://github.com/hatayama/unity-cli-loop/compare/dispatcher-v3.4.0...dispatcher-v3.4.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* skills list no longer reports installed skills as outdated when other tools leave files beside SKILL.md ([#2664](https://github.com/hatayama/unity-cli-loop/issues/2664)) ([dcffdb7](https://github.com/hatayama/unity-cli-loop/commit/dcffdb787d18532d12385a17985ff29fed955a37))
+
 ## [3.4.0](https://github.com/hatayama/unity-cli-loop/compare/dispatcher-v3.3.1...dispatcher-v3.4.0) (2026-09-07)
 
 
