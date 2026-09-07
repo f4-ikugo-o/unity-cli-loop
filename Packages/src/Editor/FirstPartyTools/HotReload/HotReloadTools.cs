@@ -233,7 +233,9 @@ namespace io.github.hatayama.UnityCliLoop.FirstPartyTools
                 .ConfigureAwait(false);
             // Why switch back: SessionState for Play-entry drop recovery is a Unity Editor API.
             await MainThreadSwitcher.SwitchToMainThread(ct);
-            HotReloadPlayModeEntryDropRecorder.NotifyApplyRecovered(result.Methods);
+            HotReloadPlayModeEntryDropRecorder.NotifyApplyRecovered(
+                result.Methods,
+                result.IntroducedTypes);
 
             HotReloadResponse response = BuildApplyResponse(result, selection.ScanLimitWarnings);
             if (!string.IsNullOrEmpty(selection.SelectionMessage))
